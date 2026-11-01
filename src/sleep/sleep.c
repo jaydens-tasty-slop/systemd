@@ -400,6 +400,50 @@ static int check_wakeup_type(void) {
         return false;
 }
 
+/* A wakeup caused by our CLOCK_BOOTTIME_ALARM timer may happen before the timer actually expires: when
+ * suspending, alarmtimer_suspend() programs the RTC wake alarm in whole seconds relative to the current RTC
+ * time with its sub-second part dropped, so the RTC may fire up to a second early, and the RTC driver or
+ * platform may round down once more (e.g. amd_pmc programs its own wake timer in whole seconds). Early
+ * wakeups of up to ~2s have been observed. If the timer is due within this window when we wake up, assume
+ * the wakeup was caused by it. */
+#define TIMER_WAKEUP_SLACK_USEC (5 * USEC_PER_SEC)
+
+static int check_woken_by_timer(int tfd) {
+        struct itimerspec its;
+        usec_t left;
+        int r;
+
+        assert(tfd >= 0);
+
+        r = fd_wait_for_event(tfd, POLLIN, /* timeout= */ 0);
+        if (r < 0)
+                return r;
+        if (FLAGS_SET(r, POLLIN))
+                return true;
+
+        if (timerfd_gettime(tfd, &its) < 0)
+                return -errno;
+
+        /* The timer is one-shot and armed before suspending, so if nothing is left it expired between the
+         * poll above and now. */
+        left = timespec_load(&its.it_value);
+        if (left == 0)
+                return true;
+        if (left > TIMER_WAKEUP_SLACK_USEC)
+                return false;
+
+        /* Wait for the timer instead of just comparing against the deadline, so that it is actually expired
+         * when we proceed, like after a wakeup that happened late. The extra 100ms cover scheduling delays. */
+        log_debug("Woke up %s before the timer expires, assuming RTC wakeup by the timer and waiting for it.",
+                  FORMAT_TIMESPAN(left, USEC_PER_MSEC));
+
+        r = fd_wait_for_event(tfd, POLLIN, usec_add(left, 100 * USEC_PER_MSEC));
+        if (r < 0 && r != -EINTR)
+                return r;
+
+        return true;
+}
+
 static int custom_timer_suspend(const SleepConfig *sleep_config, SleepOperation main_operation) {
         usec_t hibernate_timestamp;
         int r;
@@ -464,11 +508,10 @@ static int custom_timer_suspend(const SleepConfig *sleep_config, SleepOperation 
                 if (r < 0)
                         return r;
 
-                r = fd_wait_for_event(tfd, POLLIN, /* timeout= */ 0);
+                r = check_woken_by_timer(tfd);
                 if (r < 0)
                         return log_error_errno(r, "Error polling timerfd: %m");
-                /* Store fd_wait status */
-                woken_by_timer = FLAGS_SET(r, POLLIN);
+                woken_by_timer = r > 0;
 
                 r = fetch_batteries_capacity_by_name(&current_capacity);
                 if (r < 0 || hashmap_isempty(current_capacity)) {
@@ -578,10 +621,10 @@ static int execute_s2h(const SleepConfig *sleep_config, SleepOperation main_oper
 
                         if (tfd >= 0) {
                                 /* Check if our HibernateDelaySec timer fired */
-                                r = fd_wait_for_event(tfd, POLLIN, /* timeout= */ 0);
+                                r = check_woken_by_timer(tfd);
                                 if (r < 0)
                                         return log_error_errno(r, "Error polling timerfd: %m");
-                                if (FLAGS_SET(r, POLLIN)) {
+                                if (r > 0) {
                                         /* Timer fired - but respect HibernateOnACPower setting */
                                         if (!sleep_config->hibernate_on_ac_power && on_ac_power() > 0) {
                                                 log_debug("Timer fired but on AC power with HibernateOnACPower=no, continuing suspend");
